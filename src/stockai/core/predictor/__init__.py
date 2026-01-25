@@ -11,14 +11,13 @@ Provides ML-based prediction capabilities:
 from stockai.core.predictor.accuracy import PredictionAccuracyTracker
 from stockai.core.predictor.features import FeatureEngineer, generate_features
 from stockai.core.predictor.xgboost_model import XGBoostPredictor
-from stockai.core.predictor.lstm_model import LSTMPredictor
+# LSTM model removed - torch dependency removed
 from stockai.core.predictor.ensemble import EnsemblePredictor
 
 __all__ = [
     "FeatureEngineer",
     "generate_features",
     "XGBoostPredictor",
-    "LSTMPredictor",
     "EnsemblePredictor",
     "PredictionAccuracyTracker",
 ]

@@ -1,6 +1,6 @@
 """Ensemble Predictor for StockAI.
 
-Combines XGBoost and LSTM predictions with sentiment modifier
+Combines XGBoost predictions with sentiment modifier
 for robust direction predictions.
 """
 
@@ -11,37 +11,33 @@ from typing import Any
 import pandas as pd
 
 from stockai.core.predictor.xgboost_model import XGBoostPredictor
-from stockai.core.predictor.lstm_model import LSTMPredictor
+# LSTM model removed - torch dependency removed
 
 logger = logging.getLogger(__name__)
 
 
 class EnsemblePredictor:
-    """Ensemble predictor combining multiple models.
+    """Ensemble predictor combining XGBoost with sentiment.
 
     Weights:
-    - XGBoost: 0.4 (fast, interpretable)
-    - LSTM: 0.4 (captures sequences)
-    - Sentiment: 0.2 (modifier)
+    - XGBoost: 0.7 (fast, interpretable)
+    - Sentiment: 0.3 (modifier)
 
     Features:
     - Weighted probability combination
-    - Majority vote with confidence threshold
     - Calibrated confidence output
     - Model contribution visibility
     """
 
     DEFAULT_WEIGHTS = {
-        "xgboost": 0.4,
-        "lstm": 0.4,
-        "sentiment": 0.2,
+        "xgboost": 0.7,
+        "sentiment": 0.3,
     }
 
     def __init__(
         self,
         weights: dict[str, float] | None = None,
         xgboost_path: Path | None = None,
-        lstm_path: Path | None = None,
         confidence_threshold: float = 0.55,
     ):
         """Initialize ensemble predictor.
@@ -49,7 +45,6 @@ class EnsemblePredictor:
         Args:
             weights: Model weights (must sum to 1.0)
             xgboost_path: Path to XGBoost model
-            lstm_path: Path to LSTM model
             confidence_threshold: Minimum for strong prediction
         """
         self.weights = weights or self.DEFAULT_WEIGHTS.copy()
@@ -64,9 +59,8 @@ class EnsemblePredictor:
 
         # Initialize models
         self.xgboost = XGBoostPredictor(model_path=xgboost_path)
-        self.lstm = LSTMPredictor(model_path=lstm_path)
 
-        self.models_loaded = {"xgboost": False, "lstm": False}
+        self.models_loaded = {"xgboost": False}
 
     def load_models(self) -> dict[str, bool]:
         """Load all component models.
@@ -75,10 +69,9 @@ class EnsemblePredictor:
             Dict of model name -> load success
         """
         self.models_loaded["xgboost"] = self.xgboost.load()
-        self.models_loaded["lstm"] = self.lstm.load()
 
         loaded_count = sum(self.models_loaded.values())
-        logger.info(f"Loaded {loaded_count}/2 models")
+        logger.info(f"Loaded {loaded_count}/1 models")
 
         return self.models_loaded
 
@@ -116,21 +109,6 @@ class EnsemblePredictor:
                 logger.warning(f"XGBoost prediction failed: {e}")
                 contributions["xgboost"] = {"error": str(e)}
 
-        # LSTM prediction
-        if self.models_loaded.get("lstm"):
-            try:
-                lstm_result = self.lstm.predict(df)
-                lstm_prob = lstm_result["probability"]
-                contributions["lstm"] = {
-                    "probability": lstm_prob,
-                    "direction": lstm_result["direction"],
-                    "weight": self.weights["lstm"],
-                }
-                weighted_prob += lstm_prob * self.weights["lstm"]
-                active_weight += self.weights["lstm"]
-            except Exception as e:
-                logger.warning(f"LSTM prediction failed: {e}")
-                contributions["lstm"] = {"error": str(e)}
 
         # Sentiment modifier
         if sentiment_score is not None:
@@ -170,13 +148,8 @@ class EnsemblePredictor:
         else:
             confidence_level = "LOW"
 
-        # Check model agreement
-        directions = []
-        for model in ["xgboost", "lstm"]:
-            if model in contributions and "direction" in contributions[model]:
-                directions.append(contributions[model]["direction"])
-
-        agreement = len(set(directions)) == 1 if directions else False
+        # Check model agreement (not applicable with single model)
+        agreement = True
 
         return {
             "direction": direction,
@@ -186,7 +159,7 @@ class EnsemblePredictor:
             "model": "ensemble",
             "model_agreement": agreement,
             "contributions": contributions,
-            "active_models": sum(1 for m in ["xgboost", "lstm"] if self.models_loaded.get(m)),
+            "active_models": sum(1 for m in ["xgboost"] if self.models_loaded.get(m)),
         }
 
     def _calibrate_confidence(
@@ -194,9 +167,7 @@ class EnsemblePredictor:
         raw_confidence: float,
         contributions: dict,
     ) -> float:
-        """Calibrate confidence based on model agreement.
-
-        If models disagree, reduce confidence.
+        """Calibrate confidence based on sentiment availability.
 
         Args:
             raw_confidence: Raw confidence from weighted average
@@ -205,16 +176,6 @@ class EnsemblePredictor:
         Returns:
             Calibrated confidence (0-1)
         """
-        directions = []
-        for model in ["xgboost", "lstm"]:
-            if model in contributions and "direction" in contributions[model]:
-                directions.append(contributions[model]["direction"])
-
-        # If models disagree, reduce confidence
-        if len(set(directions)) > 1:
-            # Disagreement penalty
-            raw_confidence *= 0.7
-
         # Slight reduction if sentiment not available
         if contributions.get("sentiment", {}).get("score") is None:
             raw_confidence *= 0.95
@@ -260,14 +221,10 @@ class EnsemblePredictor:
             "models_loaded": self.models_loaded,
             "weights": self.weights,
             "xgboost_metrics": {},
-            "lstm_metrics": {},
         }
 
         if self.models_loaded.get("xgboost"):
             summary["xgboost_metrics"] = self.xgboost.training_metrics
-
-        if self.models_loaded.get("lstm"):
-            summary["lstm_metrics"] = self.lstm.training_metrics
 
         return summary
 
@@ -276,7 +233,6 @@ class EnsemblePredictor:
         train_df: pd.DataFrame,
         horizon: int = 3,
         xgboost_params: dict | None = None,
-        lstm_params: dict | None = None,
     ) -> dict[str, Any]:
         """Train all component models.
 
@@ -284,7 +240,6 @@ class EnsemblePredictor:
             train_df: OHLCV training data
             horizon: Prediction horizon in days
             xgboost_params: XGBoost training params
-            lstm_params: LSTM training params
 
         Returns:
             Training metrics for all models
@@ -310,20 +265,6 @@ class EnsemblePredictor:
             logger.error(f"XGBoost training failed: {e}")
             results["xgboost"] = {"error": str(e)}
 
-        # Train LSTM
-        logger.info("Training LSTM model...")
-        try:
-            lstm_metrics = self.lstm.train(
-                train_df,
-                horizon=horizon,
-                **(lstm_params or {}),
-            )
-            results["lstm"] = lstm_metrics
-            self.models_loaded["lstm"] = True
-        except Exception as e:
-            logger.error(f"LSTM training failed: {e}")
-            results["lstm"] = {"error": str(e)}
-
         return results
 
     def save_all(self) -> dict[str, bool]:
@@ -336,9 +277,6 @@ class EnsemblePredictor:
 
         if self.models_loaded.get("xgboost"):
             results["xgboost"] = self.xgboost.save()
-
-        if self.models_loaded.get("lstm"):
-            results["lstm"] = self.lstm.save()
 
         return results
 

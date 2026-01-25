@@ -3,7 +3,6 @@
 Tests the ML prediction pipeline including:
 - Feature engineering
 - XGBoost classifier
-- LSTM sequence model
 - Ensemble predictor
 """
 
@@ -16,14 +15,13 @@ from datetime import datetime, timedelta
 # Skip all tests if ML dependencies not available
 try:
     import xgboost
-    import torch
     HAS_ML_DEPS = True
 except ImportError:
     HAS_ML_DEPS = False
 
 pytestmark = pytest.mark.skipif(
     not HAS_ML_DEPS,
-    reason="ML dependencies (xgboost, torch) not installed"
+    reason="ML dependencies (xgboost) not installed"
 )
 
 
@@ -295,116 +293,10 @@ class TestXGBoostPredictor:
             predictor.train(small_df)
 
 
-@pytest.mark.skip(reason="LSTM tests cause segfaults on some PyTorch installations")
-class TestLSTMPredictor:
-    """Tests for LSTM sequence model.
-
-    Note: These tests are skipped by default due to PyTorch/MPS compatibility
-    issues that can cause segmentation faults on macOS with M-series chips.
-    Run with: pytest -v --run-lstm to execute these tests.
-    """
-
-    def test_lstm_train(self, sample_ohlcv_data):
-        """Test LSTM model training."""
-        from stockai.core.predictor.lstm_model import LSTMPredictor
-
-        predictor = LSTMPredictor(
-            sequence_length=10,  # Shorter for faster testing
-            hidden_size=32,
-            num_layers=1,
-        )
-        metrics = predictor.train(
-            sample_ohlcv_data,
-            horizon=3,
-            epochs=5,  # Minimal epochs for testing
-            patience=3,
-        )
-
-        # Should have training metrics
-        assert "train_accuracy" in metrics
-        assert "val_accuracy" in metrics
-        assert "epochs_trained" in metrics
-        assert metrics["epochs_trained"] > 0
-
-    def test_lstm_predict(self, sample_ohlcv_data):
-        """Test LSTM prediction."""
-        from stockai.core.predictor.lstm_model import LSTMPredictor
-
-        predictor = LSTMPredictor(sequence_length=10, hidden_size=32, num_layers=1)
-        predictor.train(sample_ohlcv_data, horizon=3, epochs=3)
-
-        result = predictor.predict(sample_ohlcv_data)
-
-        # Should have required fields
-        assert "direction" in result
-        assert result["direction"] in ["UP", "DOWN"]
-        assert "probability" in result
-        assert 0 <= result["probability"] <= 1
-        assert result["model"] == "lstm"
-
-    def test_lstm_predict_proba(self, sample_ohlcv_data):
-        """Test probability prediction interface."""
-        from stockai.core.predictor.lstm_model import LSTMPredictor
-
-        predictor = LSTMPredictor(sequence_length=10, hidden_size=32, num_layers=1)
-        predictor.train(sample_ohlcv_data, horizon=3, epochs=3)
-
-        prob = predictor.predict_proba(sample_ohlcv_data)
-        assert 0 <= prob <= 1
-
-    def test_lstm_save_load(self, sample_ohlcv_data, tmp_path):
-        """Test model serialization."""
-        from stockai.core.predictor.lstm_model import LSTMPredictor
-
-        model_path = tmp_path / "lstm_test.pt"
-
-        # Train and save
-        predictor = LSTMPredictor(
-            sequence_length=10,
-            hidden_size=32,
-            num_layers=1,
-            model_path=model_path,
-        )
-        predictor.train(sample_ohlcv_data, horizon=3, epochs=3)
-        original_result = predictor.predict(sample_ohlcv_data)
-        assert predictor.save()
-
-        # Load in new predictor
-        new_predictor = LSTMPredictor(model_path=model_path)
-        assert new_predictor.load()
-
-        # Should produce same results
-        loaded_result = new_predictor.predict(sample_ohlcv_data)
-        assert loaded_result["direction"] == original_result["direction"]
-        # Allow small floating point differences
-        assert abs(loaded_result["probability"] - original_result["probability"]) < 0.01
-
-    def test_lstm_insufficient_data(self):
-        """Test error on insufficient sequence data."""
-        from stockai.core.predictor.lstm_model import LSTMPredictor
-
-        predictor = LSTMPredictor(sequence_length=20)
-
-        # Data shorter than sequence length
-        short_df = pd.DataFrame({
-            "date": pd.date_range("2024-01-01", periods=10, freq="B"),
-            "open": [100] * 10,
-            "high": [101] * 10,
-            "low": [99] * 10,
-            "close": [100] * 10,
-            "volume": [1000000] * 10,
-        })
-
-        # Train with too little data - should handle gracefully or error
-        with pytest.raises(ValueError):
-            predictor.train(short_df)
-
-
 class TestEnsemblePredictor:
     """Tests for ensemble prediction model.
 
-    Note: Tests that involve LSTM training are skipped due to PyTorch/MPS
-    compatibility issues. XGBoost-only tests are run.
+    Ensemble combines XGBoost with sentiment for robust predictions.
     """
 
     def test_ensemble_init(self):
@@ -413,16 +305,15 @@ class TestEnsemblePredictor:
 
         ensemble = EnsemblePredictor()
 
-        # Should have default weights
-        assert ensemble.weights["xgboost"] == 0.4
-        assert ensemble.weights["lstm"] == 0.4
-        assert ensemble.weights["sentiment"] == 0.2
+        # Should have default weights (no LSTM)
+        assert ensemble.weights["xgboost"] == 0.7
+        assert ensemble.weights["sentiment"] == 0.3
 
     def test_ensemble_custom_weights(self):
         """Test ensemble with custom weights."""
         from stockai.core.predictor.ensemble import EnsemblePredictor
 
-        custom_weights = {"xgboost": 0.5, "lstm": 0.3, "sentiment": 0.2}
+        custom_weights = {"xgboost": 0.6, "sentiment": 0.4}
         ensemble = EnsemblePredictor(weights=custom_weights)
 
         assert ensemble.weights == custom_weights
@@ -431,7 +322,7 @@ class TestEnsemblePredictor:
         """Test that weights are normalized if they don't sum to 1."""
         from stockai.core.predictor.ensemble import EnsemblePredictor
 
-        bad_weights = {"xgboost": 1.0, "lstm": 1.0, "sentiment": 0.5}
+        bad_weights = {"xgboost": 1.0, "sentiment": 0.5}
         ensemble = EnsemblePredictor(weights=bad_weights)
 
         # Should normalize
@@ -439,12 +330,11 @@ class TestEnsemblePredictor:
         assert abs(total - 1.0) < 0.01
 
     def test_ensemble_xgboost_only(self, sample_ohlcv_data, tmp_path):
-        """Test ensemble with XGBoost only (LSTM skipped due to PyTorch issues)."""
+        """Test ensemble with XGBoost."""
         from stockai.core.predictor.ensemble import EnsemblePredictor
         from stockai.core.predictor.xgboost_model import XGBoostPredictor
 
         xgb_path = tmp_path / "xgb.json"
-        lstm_path = tmp_path / "lstm.pt"  # Won't exist
 
         # Train XGBoost separately
         xgb_predictor = XGBoostPredictor(model_path=xgb_path)
@@ -452,16 +342,12 @@ class TestEnsemblePredictor:
         xgb_predictor.save()
 
         # Create ensemble and load
-        ensemble = EnsemblePredictor(
-            xgboost_path=xgb_path,
-            lstm_path=lstm_path,
-        )
+        ensemble = EnsemblePredictor(xgboost_path=xgb_path)
 
         loaded = ensemble.load_models()
         assert loaded["xgboost"]
-        assert not loaded["lstm"]
 
-        # Should still produce valid predictions with just XGBoost
+        # Should produce valid predictions
         result = ensemble.predict(sample_ohlcv_data)
 
         assert "direction" in result
@@ -472,12 +358,11 @@ class TestEnsemblePredictor:
         assert result["active_models"] == 1
 
     def test_ensemble_predict_with_sentiment_xgboost_only(self, sample_ohlcv_data, tmp_path):
-        """Test prediction with sentiment modifier (XGBoost only)."""
+        """Test prediction with sentiment modifier."""
         from stockai.core.predictor.ensemble import EnsemblePredictor
         from stockai.core.predictor.xgboost_model import XGBoostPredictor
 
         xgb_path = tmp_path / "xgb.json"
-        lstm_path = tmp_path / "lstm.pt"
 
         # Train XGBoost separately
         xgb_predictor = XGBoostPredictor(model_path=xgb_path)
@@ -485,10 +370,7 @@ class TestEnsemblePredictor:
         xgb_predictor.save()
 
         # Create ensemble
-        ensemble = EnsemblePredictor(
-            xgboost_path=xgb_path,
-            lstm_path=lstm_path,
-        )
+        ensemble = EnsemblePredictor(xgboost_path=xgb_path)
         ensemble.load_models()
 
         # Positive sentiment should push toward UP
@@ -503,7 +385,7 @@ class TestEnsemblePredictor:
         assert result_pos["contributions"]["sentiment"]["score"] == 0.8
 
     def test_ensemble_confidence_xgboost_only(self, sample_ohlcv_data, tmp_path):
-        """Test confidence calibration (XGBoost only)."""
+        """Test confidence calibration."""
         from stockai.core.predictor.ensemble import EnsemblePredictor
         from stockai.core.predictor.xgboost_model import XGBoostPredictor
 
@@ -532,12 +414,10 @@ class TestEnsemblePredictor:
 
         ensemble = EnsemblePredictor(
             xgboost_path=tmp_path / "nonexistent.json",
-            lstm_path=tmp_path / "nonexistent.pt",
         )
 
         loaded = ensemble.load_models()
         assert not loaded["xgboost"]
-        assert not loaded["lstm"]
 
         # Prediction should still work (with 0 active models)
         result = ensemble.predict(small_ohlcv_data)
@@ -564,9 +444,8 @@ class TestEnsemblePredictor:
         assert "models_loaded" in summary
         assert "weights" in summary
         assert "xgboost_metrics" in summary
-        assert "lstm_metrics" in summary
 
-    @pytest.mark.skip(reason="LSTM training causes segfaults on some PyTorch installations")
+    @pytest.mark.skip(reason="Test needs update for new ensemble architecture")
     def test_ensemble_train_all(self, sample_ohlcv_data, tmp_path):
         """Test training all models."""
         from stockai.core.predictor.ensemble import EnsemblePredictor

@@ -778,11 +778,9 @@ def predict(
             # Load ensemble predictor
             model_dir = settings.project_root / "data" / "models"
             xgb_path = model_dir / "xgboost_v1.json"
-            lstm_path = model_dir / "lstm_v1.pt"
 
             ensemble = EnsemblePredictor(
                 xgboost_path=xgb_path,
-                lstm_path=lstm_path,
             )
 
             # Load models
@@ -795,8 +793,7 @@ def predict(
                 console.print(
                     Panel(
                         f"[dim]Expected model locations:[/dim]\n"
-                        f"  • XGBoost: {xgb_path}\n"
-                        f"  • LSTM: {lstm_path}\n\n"
+                        f"  • XGBoost: {xgb_path}\n\n"
                         "[yellow]Showing placeholder prediction...[/yellow]",
                         title="⚠️ Models Not Trained",
                     )
@@ -826,7 +823,7 @@ def predict(
 
     except ImportError as e:
         console.print(f"[red]Error:[/red] Missing required package: {e}")
-        console.print("Install with: pip install torch xgboost")
+        console.print("Install with: pip install xgboost")
         raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -1460,13 +1457,11 @@ def train(
     model_dir.mkdir(parents=True, exist_ok=True)
 
     xgb_path = model_dir / "xgboost_v1.json"
-    lstm_path = model_dir / "lstm_v1.pt"
 
     # Check if models exist
-    if not force and xgb_path.exists() and lstm_path.exists():
+    if not force and xgb_path.exists():
         console.print("[green]✓[/green] Models already trained.")
         console.print(f"  XGBoost: {xgb_path}")
-        console.print(f"  LSTM: {lstm_path}")
         console.print("\nUse --force to retrain.")
         return
 
@@ -1526,7 +1521,6 @@ def train(
 
             ensemble = EnsemblePredictor(
                 xgboost_path=xgb_path,
-                lstm_path=lstm_path,
             )
 
             # Train models
@@ -1536,7 +1530,6 @@ def train(
                 combined_df,
                 horizon=horizon,
                 xgboost_params={"n_estimators": 100, "max_depth": 6},
-                lstm_params={"epochs": 50, "patience": 10},
             )
 
             progress.update(task, description="Saving models...")
@@ -1562,23 +1555,11 @@ def train(
             console.print(f"[red]XGBoost training failed:[/red] {xgb_result['error']}")
 
         console.print()
-
-        # LSTM results
-        lstm_result = results.get("lstm", {})
-        if "error" not in lstm_result:
-            console.print("[bold]LSTM Results:[/bold]")
-            console.print(f"  Train Accuracy: {lstm_result.get('train_accuracy', 0):.1%}")
-            console.print(f"  Val Accuracy: {lstm_result.get('val_accuracy', 0):.1%}")
-            console.print(f"  Epochs Trained: {lstm_result.get('epochs_trained', 0)}")
-            console.print(f"  Saved: {lstm_path}")
-        else:
-            console.print(f"[red]LSTM training failed:[/red] {lstm_result['error']}")
-
         console.print(f"\n[dim]Completed in {elapsed:.1f}s[/dim]")
 
     except ImportError as e:
         console.print(f"[red]Error:[/red] Missing required package: {e}")
-        console.print("Install with: pip install torch xgboost scikit-learn")
+        console.print("Install with: pip install xgboost scikit-learn")
         raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
