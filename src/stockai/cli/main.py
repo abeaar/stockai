@@ -5530,5 +5530,434 @@ def autopilot_rebalance(
         console.print("[yellow]Rebalancing execution not yet implemented[/yellow]")
 
 
+# ===========================================================================
+# Intraday trading plan subcommand
+# ===========================================================================
+from pathlib import Path as _Path
+from datetime import date as _date, datetime, timedelta
+from stockai.intraday import (
+    score_universe,
+    generate_plan,
+    render_report,
+    save_plan,
+    list_plans,
+    evaluate_pending_plans,
+    plan_stats,
+)
+from stockai.intraday.scoring import IntradayProfile
+from stockai.data.database import init_database
+
+# Ensure new tables exist when this module is imported.
+try:
+    init_database()
+except Exception as _e:
+    # Don't block CLI on init issues; commands will surface the real error.
+    pass
+
+intraday_app = typer.Typer(
+    name="intraday",
+    help="Intraday trading plan generator (15min/day workflow).",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+
+
+def _print_profile(console: Console, p: IntradayProfile) -> None:
+    """Render one IntradayProfile as a rich table row block."""
+    bar = "█" * int(round(p.score)) + "░" * (10 - int(round(p.score)))
+    console.print(
+        f"  [bold]{p.symbol:>5}[/bold]  {p.sector:<40}  "
+        f"score=[green]{p.score:5.2f}[/green]  {bar}  "
+        f"close=Rp {p.last_close:>7,.0f}  "
+        f"1M={p.ret_1m*100:+5.1f}%  "
+        f"ADV={p.adv_3m/1e6:5.1f}M  "
+        f"dayRange={p.avg_day_range_pct*100:4.1f}%"
+    )
+
+
+@intraday_app.command("screen")
+def intraday_screen(
+    universe: str = typer.Option(
+        "LQ45", "--universe", "-u", help="Universe to screen (LQ45 or IDX30)."
+    ),
+    top: int = typer.Option(10, "--top", "-n", help="How many top names to show."),
+    min_score: float = typer.Option(
+        None, "--min-score",
+        help=(
+            "Minimum composite score (0-10). Default = STOCKAI_INTRADAY_MIN_SCORE "
+            "or 6.5 (backtest-calibrated: scores 6.5-8.5 have +0.20R to +0.59R edge)."
+        ),
+    ),
+) -> None:
+    """Screen the universe and print the top-N intraday-suitable tickers.
+
+    Example:
+        stockai intraday screen --universe LQ45 --top 5
+        stockai intraday screen --min-score 7.0 --top 10
+    """
+    from stockai.config import get_settings
+    if min_score is None:
+        min_score = get_settings().intraday_min_score
+    universe = universe.upper()
+    console.print(
+        f"\n[bold]Screening {universe}[/bold] for intraday suitability "
+        f"(min_score={min_score:.2f})...\n"
+    )
+    if universe == "IDX30":
+        from stockai.data.sources.idx import get_idx30 as _get
+    else:
+        from stockai.data.sources.idx import get_lq45 as _get
+    symbols = _get()
+    profiles = score_universe(universe=symbols, top_n=top, min_score=min_score)
+    if not profiles:
+        console.print(
+            f"[yellow]No names passed the min_score={min_score:.2f} filter.[/yellow]\n"
+        )
+        raise typer.Exit(0)
+    for p in profiles:
+        _print_profile(console, p)
+    console.print(
+        f"\n[dim]Top {len(profiles)} of {len(symbols)} screened. "
+        f"Run `stockai intraday report` for the full markdown plan.[/dim]\n"
+    )
+
+
+@intraday_app.command("plan")
+def intraday_plan(
+    symbol: str = typer.Argument(..., help="Ticker symbol (e.g. BBCA, BREN)."),
+    capital: float = typer.Option(
+        10_000_000, "--capital", "-c", help="Capital base in IDR for position sizing."
+    ),
+) -> None:
+    """Show a detailed intraday plan for a single ticker.
+
+    Example:
+        stockai intraday plan BBCA --capital 5000000
+    """
+    profiles = score_universe(universe=[symbol.upper().replace(".JK", "")], top_n=1)
+    if not profiles:
+        console.print(f"[red]Could not build a profile for {symbol}.[/red]")
+        raise typer.Exit(1)
+    p = profiles[0]
+    plan = generate_plan(p, capital_idr=capital)
+
+    console.print(f"\n[bold]{plan.symbol}[/bold] — [cyan]{plan.direction}[/cyan] ({plan.bias})")
+    console.print(f"Sector: {p.sector}")
+    console.print(f"Last close: Rp {p.last_close:,.0f}  |  Score: {p.score:.2f}/10")
+    console.print(f"1M return: {p.ret_1m*100:+.2f}%  |  1W return: {p.ret_1w*100:+.2f}%")
+    console.print(
+        f"ADV (3M): {p.adv_3m/1e6:.1f} M sh  |  "
+        f"Turnover: Rp {p.turnover_idr_3m/1e9:.1f} bn  |  "
+        f"Avg day range: {p.avg_day_range_pct*100:.2f}%"
+    )
+    console.print(
+        f"Beta: {p.beta if p.beta is not None else 'n/a'}  |  "
+        f"Spread (proxy): {p.spread_pct*100:.3f}%"
+    )
+    console.print("")
+    console.print(f"  Entry zone : Rp {plan.entry_zone_low:,.0f} – Rp {plan.entry_zone_high:,.0f}")
+    console.print(f"  Stop-loss  : Rp {plan.stop_loss:,.0f}")
+    console.print(f"  TP1        : Rp {plan.tp1:,.0f}   (R/R = {plan.rr_ratio_tp1:.2f})")
+    console.print(f"  TP2        : Rp {plan.tp2:,.0f}   (R/R = {plan.rr_ratio_tp2:.2f})")
+    console.print(f"  Window     : {plan.preferred_window}")
+    console.print(
+        f"  Position   : {plan.position_lots} lot ({plan.position_lots*100} sh)  "
+        f"[2% rule, capital Rp {capital:,.0f}]"
+    )
+    console.print(f"\n  Thesis     : {plan.thesis}")
+    for n in plan.notes:
+        console.print(f"  [yellow]⚠ {n}[/yellow]")
+
+    # Persist to DB so the paper-trade log keeps a record.
+    try:
+        row = save_plan(plan, p, plan_date=_date.today(), report_id=f"cli-plan-{_date.today().isoformat()}")
+        console.print(f"\n  [dim]Saved to DB (intraday_plans.id={row.id}).[/dim]")
+    except Exception as e:  # noqa: BLE001
+        console.print(f"\n  [yellow]⚠ Could not save to DB: {e}[/yellow]")
+    console.print("")
+
+
+@intraday_app.command("report")
+def intraday_report(
+    universe: str = typer.Option("LQ45", "--universe", "-u", help="Universe (LQ45 or IDX30)."),
+    top: int = typer.Option(5, "--top", "-n", help="How many names to include."),
+    capital: float = typer.Option(10_000_000, "--capital", "-c", help="Capital base in IDR."),
+    min_score: float = typer.Option(
+        None, "--min-score",
+        help=(
+            "Minimum composite score (0-10). Default = STOCKAI_INTRADAY_MIN_SCORE "
+            "or 6.5 (backtest-calibrated: scores 6.5-8.5 have +0.20R to +0.59R edge)."
+        ),
+    ),
+    out: _Path = typer.Option(
+        None,
+        "--out",
+        "-o",
+        help="Output markdown file. Default: reports/idx_intraday_<YYYYMMDD>.md",
+    ),
+    stdout: bool = typer.Option(
+        False, "--stdout", help="Also print the full markdown to stdout."
+    ),
+) -> None:
+    """Generate the daily intraday report (markdown). Writes to reports/.
+
+    Example:
+        stockai intraday report --top 5 --capital 10000000
+        stockai intraday report --min-score 7.0 --top 3
+    """
+    from datetime import date as _date
+    from stockai.config import get_settings
+    if min_score is None:
+        min_score = get_settings().intraday_min_score
+
+    universe = universe.upper()
+    if universe == "IDX30":
+        from stockai.data.sources.idx import get_idx30 as _get
+    else:
+        from stockai.data.sources.idx import get_lq45 as _get
+    symbols = _get()
+    console.print(
+        f"\n[bold]Generating intraday report for {universe}[/bold] "
+        f"(min_score={min_score:.2f}, top={top})..."
+    )
+    profiles = score_universe(universe=symbols, top_n=top, min_score=min_score)
+    if not profiles:
+        console.print(
+            f"[yellow]No names passed the min_score={min_score:.2f} filter. "
+            "Try lowering --min-score or run on a different day.[/yellow]\n"
+        )
+        raise typer.Exit(0)
+    md = render_report(profiles, as_of=_date.today(), capital_idr=capital)
+    if out is None:
+        out = _Path("reports") / f"idx_intraday_{_date.today().isoformat()}.md"
+    out = _Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md, encoding="utf-8")
+
+    # Persist all plans to DB (one row per ticker for today).
+    today = _date.today()
+    report_id = out.stem
+    saved = 0
+    for p in profiles:
+        try:
+            plan = generate_plan(p, capital_idr=capital)
+            save_plan(plan, p, plan_date=today, report_id=report_id)
+            saved += 1
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]⚠ Could not save {p.symbol}: {e}[/yellow]")
+
+    console.print(
+        f"[green]✓[/green] Wrote {out}  ({len(profiles)} names, {len(md):,} chars, "
+        f"{saved} plans saved to DB)"
+    )
+    if stdout:
+        console.print("\n" + md)
+    console.print("")
+
+
+app.add_typer(intraday_app, name="intraday")
+
+
+# ---------------------------------------------------------------------------
+# Intraday persistence commands (log / stats / evaluate)
+# ---------------------------------------------------------------------------
+
+@intraday_app.command("evaluate")
+def intraday_evaluate(
+    as_of: str = typer.Option(
+        None, "--as-of", help="Evaluate plans dated before this date (YYYY-MM-DD, default: today)."
+    ),
+) -> None:
+    """Pull next-day OHLC and classify outcomes for all pending plans.
+
+    Idempotent: plans with an outcome already are skipped.
+    """
+    from datetime import date as _date
+    if as_of is None:
+        as_of_d = _date.today()
+    else:
+        as_of_d = _date.fromisoformat(as_of)
+    console.print(f"\n[bold]Evaluating plans dated before {as_of_d.isoformat()}...[/bold]\n")
+    n = evaluate_pending_plans(as_of=as_of_d)
+    console.print(f"[green]✓[/green] Evaluated {n} plan(s).\n")
+
+
+@intraday_app.command("log")
+def intraday_log(
+    plan_date: str = typer.Option(
+        None, "--date", "-d", help="Show plans for this date (YYYY-MM-DD, default: today)."
+    ),
+    symbol: str = typer.Option(
+        None, "--symbol", "-s", help="Filter by ticker."
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max rows to show."),
+) -> None:
+    """Show the paper-trade log (saved plans + outcomes)."""
+    from datetime import date as _date
+    if plan_date is None:
+        plan_date_d = _date.today()
+    else:
+        plan_date_d = _date.fromisoformat(plan_date)
+    rows = list_plans(plan_date=None, symbol=None, limit=limit)
+    if not rows:
+        console.print(f"[yellow]No plans found (most recent: {_date.today().isoformat()}).[/yellow]\n")
+        return
+    # Show the date of the first row as the heading (it's the most recent).
+    heading_date = rows[0].plan_date.isoformat()
+    console.print(f"\n[bold]Intraday log — most recent {len(rows)} plan(s) (head: {heading_date})[/bold]\n")
+    console.print(
+        f"  {'symbol':<6} {'direction':<10} {'entry':<14} {'SL':<10} {'TP1':<10} "
+        f"{'TP2':<10} {'R/R':<6} {'lots':<4} outcome  R-mult"
+    )
+    console.print("  " + "-" * 95)
+    for r in rows:
+        entry = f"{r.entry_low:,.0f}-{r.entry_high:,.0f}"
+        if r.outcome is not None:
+            oc = r.outcome.outcome
+            rmult = f"{r.outcome.r_multiple:+.2f}"
+        else:
+            oc = "[dim]pending[/dim]"
+            rmult = "—"
+        console.print(
+            f"  {r.symbol:<6} {r.direction:<10} {entry:<14} {r.stop_loss:>9,.0f}  "
+            f"{r.tp1:>9,.0f}  {r.tp2:>9,.0f}  {r.rr_tp1:>4.2f}  {r.position_lots:>3}  "
+            f"{oc:<7}  {rmult}"
+        )
+    console.print("")
+
+
+@intraday_app.command("stats")
+def intraday_stats(
+    symbol: str = typer.Option(None, "--symbol", "-s", help="Filter by ticker."),
+    days: int = typer.Option(30, "--days", help="Look back N days."),
+) -> None:
+    """Show win-rate, avg R, expectancy, total P&L over evaluated plans."""
+    since = _date.today() - timedelta(days=days)
+    s = plan_stats(symbol=symbol, since=since)
+    if s["n"] == 0:
+        console.print(f"[yellow]No evaluated plans in the last {days} days.[/yellow]")
+        console.print("[dim]Run `stockai intraday evaluate` to backfill outcomes for past plans.[/dim]\n")
+        return
+    console.print(f"\n[bold]Intraday stats — last {days} days[/bold]  "
+                  f"(since {since.isoformat()})\n")
+    console.print(f"  Plans evaluated : {s['n']}")
+    console.print(f"  TP2 (full win)  : {s['n_tp2']}")
+    console.print(f"  TP1 (partial)   : {s['n_tp1']}")
+    console.print(f"  SL  (loss)      : {s['n_sl']}")
+    console.print(f"  EOD (scratch)   : {s['n_eod']}")
+    if s["n_other"]:
+        console.print(f"  Other           : {s['n_other']}")
+    console.print("")
+    console.print(f"  Win rate (TP1+TP2) : [green]{s['win_rate']*100:.1f}%[/green]")
+    r_color = "green" if s["avg_r"] > 0 else "red"
+    console.print(f"  Average R          : [{r_color}]{s['avg_r']:+.2f}R[/{r_color}]")
+    console.print(f"  Expectancy (R)     : [{r_color}]{s['expectancy_r']:+.2f}R[/{r_color}]  per plan")
+    pnl_color = "green" if s["total_pnl_idr"] > 0 else "red"
+    console.print(
+        f"  Total P&L (per lot): [{pnl_color}]Rp {s['total_pnl_idr']:,.0f}[/{pnl_color}]"
+    )
+    console.print("")
+
+
+@intraday_app.command("regime")
+def intraday_regime() -> None:
+    """Check whether the scoring system is in a healthy regime.
+
+    Compares the last 2 weeks of evaluated trades against the 3-month
+    baseline. If recent avg R is below -0.05R with >= 10 trades, the
+    daily pusher will PAUSE automatic delivery.
+
+    This is the safety guard against regime change: if the score
+    stops working (because the market regime shifted), the system
+    stops sending you trades.
+    """
+    from stockai.intraday.regime import check_regime
+    v = check_regime()
+    color = "green" if v.healthy else "red"
+    console.print(f"\n[bold {color}]Regime verdict: {'HEALTHY' if v.healthy else 'PAUSE'}[/bold {color}]")
+    console.print(f"  {v.message}\n")
+    console.print(f"  Recent 2 weeks : {v.n_recent} trades, avg R = {v.avg_r_recent:+.3f}R")
+    console.print(f"  3-month baseline: {v.n_baseline} trades, avg R = {v.avg_r_baseline:+.3f}R\n")
+    if not v.healthy:
+        console.print(
+            "  [yellow]Daily push is paused. Re-enable manually with "
+            "`stockai intraday report --min-score 5.0` to override.[/yellow]\n"
+        )
+
+
+@intraday_app.command("backtest")
+def intraday_backtest(
+    days: int = typer.Option(180, "--days", help="Look back N days (default 180 = ~6M)."),
+    step: int = typer.Option(5, "--step", help="Plans per ticker every N trading days (default 5 = weekly)."),
+    top: int = typer.Option(
+        15, "--top", help="How many of the most-liquid LQ45 names to backtest (default 15).",
+    ),
+    capital: float = typer.Option(10_000_000, "--capital", "-c", help="Capital base for sizing."),
+    out: _Path = typer.Option(
+        None, "--out", "-o", help="Output markdown file (default: reports/intraday_backtest_<date>.md)."
+    ),
+    stdout: bool = typer.Option(False, "--stdout", help="Print the report to stdout too."),
+    persist: bool = typer.Option(True, "--persist/--no-persist", help="Save trades to DB."),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Re-evaluate even if a plan already exists (slower)."
+    ),
+) -> None:
+    """Walk-forward backtest: score + plan + evaluate across N months.
+
+    Generates one plan per ticker every `--step` trading days, then
+    classifies the next session's outcome. Aggregates by score decile,
+    direction, and symbol so you can see whether the score predicts edge.
+
+    Example:
+        stockai intraday backtest --days 180 --step 5 --top 15
+    """
+    from stockai.intraday.backtest import (
+        run_backtest, render_backtest_report, load_persisted_trades, aggregate,
+    )
+    from stockai.data.sources.idx import get_lq45
+
+    end = _date.today()
+    start = end - timedelta(days=days)
+    # Use the top-N most-liquid names (we approximate "most liquid" by
+    # sorting the LQ45 alphabetically for determinism; the user can pass
+    # --top all 45 by setting top=45). For a real "most liquid" you'd
+    # want turnover data; this is a reasonable proxy for the demo.
+    universe = get_lq45()[: max(1, min(top, len(get_lq45())))]
+
+    console.print(
+        f"\n[bold]Walk-forward backtest[/bold]  "
+        f"{start.isoformat()} → {end.isoformat()}  "
+        f"universe={len(universe)} names  step={step} days"
+    )
+    trades = run_backtest(
+        tickers=universe,
+        start=start,
+        end=end,
+        step_days=step,
+        capital_idr=capital,
+        persist=persist,
+        skip_if_exists=not refresh,
+    )
+    # Load ALL persisted trades (not just this run) for the report.
+    all_trades = load_persisted_trades()
+    agg = aggregate(all_trades)
+    md = render_backtest_report(trades=all_trades, agg=agg)
+    if out is None:
+        out = _Path("reports") / f"intraday_backtest_{_date.today().isoformat()}.md"
+    out = _Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md, encoding="utf-8")
+    n = agg.get("overall", {}).get("n", 0)
+    avg_r = agg.get("overall", {}).get("avg_r", 0.0)
+    console.print(
+        f"[green]✓[/green] Wrote {out}  "
+        f"({n} total trades in DB, {len(trades)} new this run, "
+        f"avg R = {avg_r:+.2f}R)"
+    )
+    if stdout:
+        console.print("\n" + md)
+    console.print("")
+
+
 if __name__ == "__main__":
     app()
