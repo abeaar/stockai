@@ -30,18 +30,6 @@ class Settings(BaseSettings):
     firecrawl_api_key: str = Field(default="", alias="FIRECRAWL_API_KEY")
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
 
-    # Intraday module settings
-    intraday_min_score: float = Field(
-        default=6.5,
-        alias="INTRADAY_MIN_SCORE",
-        description=(
-            "Minimum composite score (0-10) to include a name in the daily "
-            "intraday report. Calibrated against the 6M walk-forward backtest "
-            "in reports/intraday_backtest_*.md: scores 6.5-8.5 have +0.20R to "
-            "+0.59R expectancy; below 6.5 is break-even; above 8.5 is rare."
-        ),
-    )
-
     # Model settings
     model: str = Field(default="gemini-3-flash-preview", description="Default LLM model")
 
